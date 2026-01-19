@@ -1,0 +1,551 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Transit Sleep Alarm</title>
+    
+    <!-- Tailwind CSS -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+    
+    <!-- React & ReactDOM -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    
+    <!-- Babel -->
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+
+    <!-- Lucide Icons -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        body { 
+            background-color: #0f172a; 
+            color: white;
+            overscroll-behavior: none;
+        }
+        #map { height: 100%; width: 100%; z-index: 0; }
+        .glass-panel {
+            background: rgba(15, 23, 42, 0.90);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+        }
+        /* Custom Scrollbar */
+        ::-webkit-scrollbar { width: 6px; }
+        ::-webkit-scrollbar-track { background: #1e293b; }
+        ::-webkit-scrollbar-thumb { background: #475569; border-radius: 3px; }
+        
+        /* Pulse Animation for active tracking */
+        @keyframes pulse-ring {
+            0% { transform: scale(0.33); }
+            80%, 100% { opacity: 0; }
+        }
+        .pulse-ring {
+            position: absolute;
+            width: 100%;
+            height: 100%;
+            border-radius: 50%;
+            animation: pulse-ring 1.25s cubic-bezier(0.215, 0.61, 0.355, 1) infinite;
+            background-color: #3b82f6;
+            opacity: 0.4;
+        }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef } = React;
+
+        const App = () => {
+            // Default Fallback (Thalwil/Zurich)
+            const DEFAULT_LAT = 47.29; 
+            const DEFAULT_LNG = 8.56;
+
+            // State
+            const [query, setQuery] = useState('');
+            const [isSearching, setIsSearching] = useState(false);
+            const [userLocation, setUserLocation] = useState([DEFAULT_LAT, DEFAULT_LNG]);
+            const [gpsStatus, setGpsStatus] = useState('waiting'); // waiting, active, error, manual
+            const [destination, setDestination] = useState(null);
+            const [isTracking, setIsTracking] = useState(false);
+            const [distance, setDistance] = useState(null);
+            const [alertThreshold, setAlertThreshold] = useState(1000); // meters
+            const [transportMode, setTransportMode] = useState('bus');
+            const [alertTriggered, setAlertTriggered] = useState(false);
+            const [searchResults, setSearchResults] = useState([]);
+            const [simulating, setSimulating] = useState(false);
+
+            // Refs
+            const mapRef = useRef(null);
+            const markerRef = useRef(null);
+            const destMarkerRef = useRef(null);
+            const watchIdRef = useRef(null);
+            const audioRef = useRef(null); // Added missing ref
+            const simulationInterval = useRef(null);
+
+            // Initialize Map
+            useEffect(() => {
+                if (!mapRef.current) {
+                    mapRef.current = L.map('map', {
+                        zoomControl: false,
+                        attributionControl: false
+                    }).setView([DEFAULT_LAT, DEFAULT_LNG], 13);
+
+                    L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+                        attribution: '&copy; OpenStreetMap contributors &copy; CARTO',
+                        subdomains: 'abcd',
+                        maxZoom: 20
+                    }).addTo(mapRef.current);
+
+                    // Allow clicking map to set location (Manual Override)
+                    mapRef.current.on('click', (e) => {
+                        handleManualLocationSet(e.latlng);
+                    });
+                }
+
+                // Initial Location Attempts
+                attemptGeolocation();
+            }, []);
+
+            const handleManualLocationSet = (latlng) => {
+                const newLoc = [latlng.lat, latlng.lng];
+                setUserLocation(newLoc);
+                updateUserMarker(newLoc);
+                setGpsStatus('manual');
+                // If we aren't tracking a specific destination yet, pan to click
+                if (!destination) {
+                    mapRef.current.panTo(newLoc);
+                }
+            };
+
+            const attemptGeolocation = () => {
+                setGpsStatus('locating');
+
+                // 1. Trigger IP Geolocation (Background Fallback)
+                fetch('https://ipapi.co/json/')
+                    .then(res => res.json())
+                    .then(data => {
+                        if (data.latitude && data.longitude) {
+                            setGpsStatus(prev => {
+                                // Only apply IP location if GPS hasn't locked on yet and isn't actively working
+                                if (prev !== 'active') {
+                                    const latLng = [data.latitude, data.longitude];
+                                    if(!markerRef.current) {
+                                        setUserLocation(latLng);
+                                        updateUserMarker(latLng);
+                                        if(mapRef.current) mapRef.current.setView(latLng, 12);
+                                    }
+                                    return 'manual'; // Treat IP location as approximate/manual
+                                }
+                                return prev;
+                            });
+                        }
+                    })
+                    .catch(() => console.log("IP Geo skipped"));
+
+                // 2. Trigger High Accuracy GPS
+                if ("geolocation" in navigator) {
+                    navigator.geolocation.getCurrentPosition(
+                        (pos) => {
+                            const { latitude, longitude } = pos.coords;
+                            const latLng = [latitude, longitude];
+                            setUserLocation(latLng);
+                            updateUserMarker(latLng);
+                            if(mapRef.current) mapRef.current.setView(latLng, 15);
+                            setGpsStatus('active');
+                        },
+                        (err) => {
+                            // IMPROVED ERROR HANDLING
+                            // We explicitly read the error code to give a better log and avoid empty object errors
+                            let errorMsg = "Unknown Error";
+                            switch(err.code) {
+                                case 1: errorMsg = "Permission Denied"; break;
+                                case 2: errorMsg = "Position Unavailable"; break;
+                                case 3: errorMsg = "Timeout"; break;
+                            }
+                            console.warn(`GPS Location Warning: ${errorMsg} - Switching to manual/IP fallback.`);
+                            
+                            // Don't overwrite if we found IP location already, otherwise set error
+                            setGpsStatus(prev => prev === 'manual' ? 'manual' : 'error');
+                        },
+                        { enableHighAccuracy: true, timeout: 10000 }
+                    );
+                } else {
+                    setGpsStatus('error');
+                }
+            };
+
+            // Handle Geolocation Updates
+            const updateUserMarker = (latLng) => {
+                if (!mapRef.current) return;
+
+                if (markerRef.current) {
+                    markerRef.current.setLatLng(latLng);
+                } else {
+                    const icon = L.divIcon({
+                        className: 'user-marker',
+                        html: `<div style="position:relative; width:20px; height:20px;">
+                                <div class="pulse-ring"></div>
+                                <div style="background-color: #3b82f6; width: 14px; height: 14px; border-radius: 50%; border: 2px solid white; position: absolute; top: 3px; left: 3px;"></div>
+                               </div>`,
+                        iconSize: [20, 20],
+                        iconAnchor: [10, 10]
+                    });
+                    markerRef.current = L.marker(latLng, { icon }).addTo(mapRef.current);
+                }
+            };
+
+            // Search Address using Nominatim
+            const handleSearch = async (e) => {
+                e.preventDefault();
+                if (!query) return;
+                setIsSearching(true);
+                
+                try {
+                    const res = await fetch(`https://nominatim.openstreetmap.org/search?format=json&q=${encodeURIComponent(query)}`);
+                    const data = await res.json();
+                    setSearchResults(data);
+                } catch (err) {
+                    console.error("Search failed", err);
+                } finally {
+                    setIsSearching(false);
+                }
+            };
+
+            const selectDestination = (place) => {
+                const lat = parseFloat(place.lat);
+                const lon = parseFloat(place.lon);
+                const latLng = [lat, lon];
+                
+                setDestination(latLng);
+                setSearchResults([]);
+                setQuery(place.display_name.split(',')[0]); 
+
+                if (destMarkerRef.current) {
+                    destMarkerRef.current.setLatLng(latLng);
+                } else {
+                    const icon = L.divIcon({
+                        className: 'dest-marker',
+                        html: `<div style="background-color: #ef4444; width: 16px; height: 16px; transform: rotate(45deg); border: 2px solid white; box-shadow: 0 2px 4px rgba(0,0,0,0.5);"></div>`,
+                        iconSize: [16, 16],
+                        iconAnchor: [8, 8]
+                    });
+                    destMarkerRef.current = L.marker(latLng, { icon }).addTo(mapRef.current);
+                }
+
+                if (userLocation) {
+                    const bounds = L.latLngBounds([userLocation, latLng]);
+                    mapRef.current.fitBounds(bounds, { padding: [50, 50] });
+                }
+            };
+
+            // Calculate Distance (Haversine Formula)
+            const calculateDistance = (pos1, pos2) => {
+                const R = 6371e3;
+                const φ1 = pos1[0] * Math.PI/180;
+                const φ2 = pos2[0] * Math.PI/180;
+                const Δφ = (pos2[0]-pos1[0]) * Math.PI/180;
+                const Δλ = (pos2[1]-pos1[1]) * Math.PI/180;
+
+                const a = Math.sin(Δφ/2) * Math.sin(Δφ/2) +
+                        Math.cos(φ1) * Math.cos(φ2) *
+                        Math.sin(Δλ/2) * Math.sin(Δλ/2);
+                const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+                return R * c; 
+            };
+
+            // Main Tracking Loop
+            useEffect(() => {
+                if (userLocation && destination) {
+                    const dist = calculateDistance(userLocation, destination);
+                    setDistance(dist);
+
+                    if (isTracking && dist < alertThreshold && !alertTriggered) {
+                        triggerAlert();
+                    }
+                }
+            }, [userLocation, destination, isTracking, alertThreshold]);
+
+            const triggerAlert = () => {
+                setAlertTriggered(true);
+                if (navigator.vibrate) navigator.vibrate([500, 200, 500, 200, 500]);
+                playAlarmSound();
+            };
+
+            const playAlarmSound = () => {
+                const AudioContext = window.AudioContext || window.webkitAudioContext;
+                if (!AudioContext) return;
+                
+                const ctx = new AudioContext();
+                const osc = ctx.createOscillator();
+                const gain = ctx.createGain();
+                
+                osc.connect(gain);
+                gain.connect(ctx.destination);
+                
+                osc.type = 'sawtooth'; // More alarming sound
+                osc.frequency.setValueAtTime(440, ctx.currentTime);
+                osc.frequency.linearRampToValueAtTime(880, ctx.currentTime + 0.1);
+                osc.frequency.linearRampToValueAtTime(440, ctx.currentTime + 0.2);
+                
+                gain.gain.setValueAtTime(0.2, ctx.currentTime);
+                gain.gain.exponentialRampToValueAtTime(0.00001, ctx.currentTime + 2);
+                
+                osc.start();
+                osc.stop(ctx.currentTime + 2);
+            };
+
+            const toggleTracking = () => {
+                if (isTracking) {
+                    setIsTracking(false);
+                    setSimulating(false);
+                    if (watchIdRef.current) navigator.geolocation.clearWatch(watchIdRef.current);
+                    if (simulationInterval.current) clearInterval(simulationInterval.current);
+                } else {
+                    if (!destination) {
+                        alert("Please select a destination first.");
+                        return;
+                    }
+                    setIsTracking(true);
+                    setAlertTriggered(false);
+                    
+                    // Real Geolocation Watcher
+                    watchIdRef.current = navigator.geolocation.watchPosition(
+                        (pos) => {
+                            const latLng = [pos.coords.latitude, pos.coords.longitude];
+                            if (!simulating) {
+                                setUserLocation(latLng);
+                                updateUserMarker(latLng);
+                                setGpsStatus('active');
+                            }
+                        },
+                        (err) => {
+                            console.warn("Tracking GPS Lost:", err.message);
+                            setGpsStatus('error');
+                        },
+                        { enableHighAccuracy: true, maximumAge: 10000 }
+                    );
+                }
+            };
+
+            const startSimulation = () => {
+                if (!userLocation || !destination) return;
+                
+                setSimulating(true);
+                setIsTracking(true);
+                setAlertTriggered(false);
+
+                let currentLat = userLocation[0];
+                let currentLng = userLocation[1];
+                const destLat = destination[0];
+                const destLng = destination[1];
+                
+                const steps = 100;
+                const stepLat = (destLat - currentLat) / steps;
+                const stepLng = (destLng - currentLng) / steps;
+
+                if (simulationInterval.current) clearInterval(simulationInterval.current);
+
+                simulationInterval.current = setInterval(() => {
+                    currentLat += stepLat;
+                    currentLng += stepLng;
+                    
+                    const newPos = [currentLat, currentLng];
+                    setUserLocation(newPos);
+                    updateUserMarker(newPos);
+
+                    const dist = calculateDistance(newPos, destination);
+                    if (dist < 50) {
+                        clearInterval(simulationInterval.current);
+                    }
+                }, 100);
+            };
+
+            const formatDistance = (meters) => {
+                if (meters === null) return '--';
+                if (meters >= 1000) return (meters / 1000).toFixed(1) + ' km';
+                return Math.round(meters) + ' m';
+            };
+
+            // Render Icons
+            useEffect(() => {
+                lucide.createIcons();
+            });
+
+            return (
+                <div className="relative h-screen w-full overflow-hidden flex flex-col">
+                    
+                    {/* Top Bar (Search) */}
+                    <div className="absolute top-0 left-0 right-0 z-[1000] p-4 pointer-events-none">
+                        <div className="flex flex-col gap-2 max-w-md mx-auto">
+                            {/* Status Badge */}
+                            <div className="flex justify-end pointer-events-auto">
+                                <div className={`px-3 py-1 rounded-full text-xs font-bold border shadow-lg backdrop-blur-md ${
+                                    gpsStatus === 'active' ? 'bg-green-500/20 text-green-400 border-green-500/30' :
+                                    gpsStatus === 'error' ? 'bg-red-500/20 text-red-400 border-red-500/30' :
+                                    gpsStatus === 'manual' ? 'bg-orange-500/20 text-orange-400 border-orange-500/30' :
+                                    'bg-slate-800/80 text-slate-400 border-slate-700'
+                                }`}>
+                                    <span className="flex items-center gap-1">
+                                        {gpsStatus === 'active' && <i data-lucide="satellite" className="w-3 h-3"></i>}
+                                        {gpsStatus === 'error' && <i data-lucide="satellite-off" className="w-3 h-3"></i>}
+                                        {gpsStatus === 'manual' && <i data-lucide="mouse-pointer-2" className="w-3 h-3"></i>}
+                                        {gpsStatus === 'active' ? 'GPS Active' : 
+                                         gpsStatus === 'error' ? 'GPS Denied - Click map to set loc' : 
+                                         gpsStatus === 'manual' ? 'Approx. Location' : 'Locating...'}
+                                    </span>
+                                </div>
+                            </div>
+
+                            <div className="glass-panel rounded-xl p-2 pointer-events-auto shadow-2xl">
+                                <form onSubmit={handleSearch} className="flex gap-2 relative">
+                                    <div className="flex-1 relative">
+                                        <i data-lucide="map-pin" className="absolute left-3 top-3 w-5 h-5 text-gray-400"></i>
+                                        <input 
+                                            type="text" 
+                                            value={query}
+                                            onChange={(e) => setQuery(e.target.value)}
+                                            placeholder="Where are you going?"
+                                            className="w-full bg-slate-800 text-white rounded-lg pl-10 pr-4 py-2.5 focus:outline-none focus:ring-2 focus:ring-blue-500 placeholder-gray-500"
+                                        />
+                                    </div>
+                                    <button type="submit" className="bg-blue-600 hover:bg-blue-700 text-white rounded-lg px-4 py-2 transition-colors">
+                                        {isSearching ? '...' : <i data-lucide="search" className="w-5 h-5"></i>}
+                                    </button>
+                                </form>
+
+                                {/* Search Results Dropdown */}
+                                {searchResults.length > 0 && (
+                                    <div className="mt-2 bg-slate-800 rounded-lg overflow-hidden border border-slate-700 max-h-60 overflow-y-auto">
+                                        {searchResults.map((place, i) => (
+                                            <div 
+                                                key={i} 
+                                                onClick={() => selectDestination(place)}
+                                                className="p-3 hover:bg-slate-700 cursor-pointer border-b border-slate-700 last:border-0 text-sm text-gray-200"
+                                            >
+                                                {place.display_name}
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Map Container */}
+                    <div id="map" className={`flex-1 bg-slate-900 ${gpsStatus === 'error' ? 'cursor-crosshair' : ''}`}></div>
+
+                    {/* Bottom Control Panel */}
+                    <div className="absolute bottom-0 left-0 right-0 z-[1000] p-4 pointer-events-none">
+                        <div className="glass-panel rounded-t-2xl md:rounded-2xl p-4 md:max-w-md md:mx-auto md:mb-4 pointer-events-auto shadow-2xl transition-all duration-300">
+                            
+                            {/* Status Header */}
+                            <div className="flex justify-between items-center mb-4">
+                                <div>
+                                    <h2 className="text-lg font-bold text-white flex items-center gap-2">
+                                        <i data-lucide={transportMode === 'bus' ? 'bus' : transportMode === 'train' ? 'train' : 'tram-front'} className="w-5 h-5 text-blue-400"></i>
+                                        Target: {formatDistance(alertThreshold)}
+                                    </h2>
+                                    <p className="text-xs text-slate-400">Alert triggers when closer than this</p>
+                                </div>
+                                <div className="text-right">
+                                    <div className="text-2xl font-mono font-bold text-blue-400">
+                                        {distance ? formatDistance(distance) : '--'}
+                                    </div>
+                                    <div className="text-xs text-slate-400 uppercase tracking-wider">Distance</div>
+                                </div>
+                            </div>
+
+                            {/* Alert Overlay */}
+                            {alertTriggered && (
+                                <div className="mb-4 bg-red-500/20 border border-red-500/50 rounded-lg p-3 flex items-center gap-3 animate-pulse">
+                                    <i data-lucide="bell-ring" className="w-6 h-6 text-red-500"></i>
+                                    <div>
+                                        <div className="font-bold text-red-100">WAKE UP!</div>
+                                        <div className="text-xs text-red-200">You are arriving at your stop.</div>
+                                    </div>
+                                    <button onClick={() => {setAlertTriggered(false); if(audioRef.current) audioRef.current.pause();}} className="ml-auto bg-red-600 px-3 py-1 rounded text-xs hover:bg-red-700">Dismiss</button>
+                                </div>
+                            )}
+
+                            {/* Settings Grid */}
+                            <div className="grid grid-cols-2 gap-3 mb-4">
+                                <div className="bg-slate-800/50 rounded-lg p-2">
+                                    <label className="text-xs text-slate-400 block mb-1">Transport</label>
+                                    <select 
+                                        value={transportMode} 
+                                        onChange={(e) => setTransportMode(e.target.value)}
+                                        className="w-full bg-slate-700 rounded px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-blue-500"
+                                    >
+                                        <option value="bus">Bus</option>
+                                        <option value="train">Train</option>
+                                        <option value="tram">Tram</option>
+                                    </select>
+                                </div>
+                                <div className="bg-slate-800/50 rounded-lg p-2">
+                                    <label className="text-xs text-slate-400 block mb-1">Wake Distance</label>
+                                    <select 
+                                        value={alertThreshold} 
+                                        onChange={(e) => setAlertThreshold(Number(e.target.value))}
+                                        className="w-full bg-slate-700 rounded px-2 py-1 text-sm outline-none focus:ring-1 focus:ring-blue-500"
+                                    >
+                                        <option value="500">500 m</option>
+                                        <option value="1000">1 km</option>
+                                        <option value="2000">2 km</option>
+                                        <option value="5000">5 km</option>
+                                    </select>
+                                </div>
+                            </div>
+
+                            {/* Action Buttons */}
+                            <div className="flex gap-2">
+                                <button 
+                                    onClick={toggleTracking}
+                                    className={`flex-1 py-3 rounded-lg font-bold flex items-center justify-center gap-2 transition-all ${
+                                        isTracking && !simulating
+                                            ? 'bg-red-500/20 text-red-400 hover:bg-red-500/30 border border-red-500/50' 
+                                            : 'bg-blue-600 hover:bg-blue-700 text-white shadow-lg shadow-blue-900/50'
+                                    }`}
+                                >
+                                    {isTracking && !simulating ? (
+                                        <>
+                                            <i data-lucide="stop-circle" className="w-5 h-5"></i>
+                                            Stop Tracking
+                                        </>
+                                    ) : (
+                                        <>
+                                            <i data-lucide="navigation" className="w-5 h-5"></i>
+                                            Start Tracking
+                                        </>
+                                    )}
+                                </button>
+                                
+                                {destination && !isTracking && (
+                                    <button 
+                                        onClick={startSimulation}
+                                        className="px-4 py-3 bg-slate-700 hover:bg-slate-600 text-white rounded-lg flex items-center justify-center"
+                                        title="Simulate Trip"
+                                    >
+                                        <i data-lucide="play-circle" className="w-5 h-5"></i>
+                                    </button>
+                                )}
+                            </div>
+
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
